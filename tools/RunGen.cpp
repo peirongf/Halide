@@ -8,6 +8,7 @@
 #include <cassert>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <sstream>
@@ -142,6 +143,86 @@ extern "C" void halide_print(void *user_context, const char *message) {
 extern "C" void halide_error(void *user_context, const char *message) {
     fail() << "halide_error: " << message;
 }
+
+class HalideMemoryTracker {
+    static HalideMemoryTracker *active;
+
+    std::mutex tracker_mutex;
+
+    // Total current CPU memory allocated via halide_malloc.
+    // Access controlled by tracker_mutex.
+    uint64_t memory_allocated;
+
+    // High-water mark of CPU memory allocated since program start
+    // (or last call to get_cpu_memory_highwater_reset).
+    // Access controlled by tracker_mutex.
+    uint64_t memory_highwater;
+
+    // Map of outstanding allocation sizes.
+    // Access controlled by tracker_mutex.
+    std::map<void *, size_t> memory_size_map;
+
+    void *tracker_malloc_impl(void *user_context, size_t x) {
+        std::lock_guard<std::mutex> lock(tracker_mutex);
+
+        void *ptr = halide_default_malloc(user_context, x);
+
+        memory_allocated += x;
+        if (memory_highwater < memory_allocated) {
+            memory_highwater = memory_allocated;
+        }
+        if (memory_size_map.find(ptr) != memory_size_map.end()) {
+            halide_error(user_context, "Tracking error in tracker_malloc");
+        }
+        memory_size_map[ptr] = x;
+
+        return ptr;
+    }
+
+    void tracker_free_impl(void *user_context, void *ptr) {
+        std::lock_guard<std::mutex> lock(tracker_mutex);
+        auto it = memory_size_map.find(ptr);
+        if (it == memory_size_map.end()) {
+            halide_error(user_context, "Tracking error in tracker_free");
+        }
+        size_t x = it->second;
+        memory_allocated -= x;
+        memory_size_map.erase(it);
+        halide_default_free(user_context, ptr);
+    }
+
+    static void *tracker_malloc(void *user_context, size_t x) {
+        return active->tracker_malloc_impl(user_context, x);
+    }
+
+    static void tracker_free(void *user_context, void *ptr) {
+        return active->tracker_free_impl(user_context, ptr);
+    }
+
+  public:
+    void install() {
+        active = this;
+        halide_set_custom_malloc(tracker_malloc);
+        halide_set_custom_free(tracker_free);
+    }
+
+    uint64_t allocated() {
+        std::lock_guard<std::mutex> lock(tracker_mutex);
+        return memory_allocated;
+    }
+
+    uint64_t highwater() {
+        std::lock_guard<std::mutex> lock(tracker_mutex);
+        return memory_highwater;
+    }
+
+    void highwater_reset() {
+        std::lock_guard<std::mutex> lock(tracker_mutex);
+        memory_highwater = memory_allocated;
+    }
+};
+
+HalideMemoryTracker *HalideMemoryTracker::active{nullptr};
 
 vector<string> split_string(const string &source, const string &delim) {
     vector<string> elements;
@@ -455,6 +536,7 @@ int main(int argc, char **argv) {
     vector<void*> filter_argv(md->num_arguments, nullptr);
     vector<string> unknown_args;
     bool benchmark = false;
+    bool track_memory = false;
     bool describe = false;
     int benchmark_samples = 3;
     int benchmark_iterations = 10;
@@ -489,6 +571,13 @@ int main(int argc, char **argv) {
                     flag_value = "true";
                 }
                 if (!parse_scalar(flag_value, &benchmark)) {
+                    fail() << "Invalid value for flag: " << flag_name;
+                }
+            } else if (flag_name == "track_memory") {
+                if (flag_value.empty()) {
+                    flag_value = "true";
+                }
+                if (!parse_scalar(flag_value, &track_memory)) {
                     fail() << "Invalid value for flag: " << flag_name;
                 }
             } else if (flag_name == "benchmark_samples") {
@@ -640,54 +729,61 @@ int main(int argc, char **argv) {
         }
     }
 
-    {
-        double pixels_out = 0.f;
-        for (auto &arg_pair : args) {
-            auto &arg_name = arg_pair.first;
-            auto &arg = arg_pair.second;
-            switch (arg.metadata->kind) {
-            case halide_argument_kind_output_buffer:
-                auto constrained_shape = get_shape(arg.buffer_value);
-                info() << "Output " << arg_name << ": BoundsQuery result is " << constrained_shape;
-                vector<halide_dimension_t> dims = fix_bounds_query_shape(constrained_shape);
-                arg.buffer_value = Buffer<>(arg.metadata->type, nullptr, dims.size(), &dims[0]);
-                info() << "Output " << arg_name << ": Shape is " << get_shape(arg.buffer_value);
-                arg.buffer_value.check_overflow();
-                arg.buffer_value.allocate();
-                filter_argv[arg.index] = arg.buffer_value.raw_buffer();
-                // TODO: this assumes that most output is "pixel-ish", and counting the size of the first
-                // two dimensions approximates the "pixel size". This is not, in general, a valid assumption,
-                // but is a useful metric for benchmarking.
-                if (dims.size() >= 2) {
-                    pixels_out += dims[0].extent * dims[1].extent;
-                } else {
-                    pixels_out += dims[0].extent;
-                }
-                break;
+    double pixels_out = 0.f;
+    for (auto &arg_pair : args) {
+        auto &arg_name = arg_pair.first;
+        auto &arg = arg_pair.second;
+        switch (arg.metadata->kind) {
+        case halide_argument_kind_output_buffer:
+            auto constrained_shape = get_shape(arg.buffer_value);
+            info() << "Output " << arg_name << ": BoundsQuery result is " << constrained_shape;
+            vector<halide_dimension_t> dims = fix_bounds_query_shape(constrained_shape);
+            arg.buffer_value = Buffer<>(arg.metadata->type, nullptr, dims.size(), &dims[0]);
+            info() << "Output " << arg_name << ": Shape is " << get_shape(arg.buffer_value);
+            arg.buffer_value.check_overflow();
+            arg.buffer_value.allocate();
+            filter_argv[arg.index] = arg.buffer_value.raw_buffer();
+            // TODO: this assumes that most output is "pixel-ish", and counting the size of the first
+            // two dimensions approximates the "pixel size". This is not, in general, a valid assumption,
+            // but is a useful metric for benchmarking.
+            if (dims.size() >= 2) {
+                pixels_out += dims[0].extent * dims[1].extent;
+            } else {
+                pixels_out += dims[0].extent;
             }
+            break;
         }
+    }
+    double megapixels = pixels_out / (1024.0 * 1024.0);
 
-        if (benchmark) {
-            // Run once to warm up cache. Ignore result since our halide_error() should catch everything.
+    HalideMemoryTracker tracker;
+    if (track_memory) {
+        tracker.install();
+    }
+
+    if (benchmark) {
+        // Run once to warm up cache. Ignore result since our halide_error() should catch everything.
+        (void) halide_rungen_trampoline_argv(&filter_argv[0]);
+
+        double time_in_seconds = Halide::Tools::benchmark(benchmark_samples, benchmark_iterations, [&filter_argv]() { 
             (void) halide_rungen_trampoline_argv(&filter_argv[0]);
+        });
 
-            double time_in_seconds = Halide::Tools::benchmark(benchmark_samples, benchmark_iterations, [&filter_argv]() { 
-                (void) halide_rungen_trampoline_argv(&filter_argv[0]);
-            });
-            double megapixels = pixels_out / (1024.0 * 1024.0);
+        cout << "Benchmark for " << md->name << " produces best case of " << time_in_seconds << " sec/iter, over " 
+            << benchmark_samples << " blocks of " << benchmark_iterations << " iterations.\n";
+        cout << "Best output throughput is " << (megapixels / time_in_seconds) << " mpix/sec.\n";
 
-            cout << "Benchmark for " << md->name << " produces best case of " << time_in_seconds << " sec/iter, over " 
-                << benchmark_samples << " blocks of " << benchmark_iterations << " iterations.\n";
-            cout << "Best output throughput is " << (megapixels / time_in_seconds) << " mpix/sec.\n";
-
-            // TODO: add memory usage metrics (e.g. highwater)
-        } else {
-            info() << "Running filter...";
-            int result = halide_rungen_trampoline_argv(&filter_argv[0]);
-            if (result != 0) {
-                fail() << "Filter failed with result code: " << result;
-            }
+    } else {
+        info() << "Running filter...";
+        int result = halide_rungen_trampoline_argv(&filter_argv[0]);
+        if (result != 0) {
+            fail() << "Filter failed with result code: " << result;
         }
+    }
+
+    if (track_memory) {
+        cout << "Maximum Halide memory: " << tracker.highwater() 
+            << " bytes for output of " << megapixels << " mpix.\n";
     }
 
     for (auto &arg_pair : args) {
